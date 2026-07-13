@@ -6,22 +6,32 @@ Supabase (login/history) will be added later - structure is ready for it.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from pathlib import Path
+import os
 import pickle
 import pandas as pd
 import numpy as np
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI(title="Cotton Fiber Yield API")
 
-# Allow the mobile app to call this API from any device
+# Thread pool for running slow SHAP in background
+executor = ThreadPoolExecutor(max_workers=2)
+
+_origins_env = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173")
+_allowed_origins = [o.strip() for o in _origins_env.split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ---- Load the trained model bundle (once, at startup) ----
-with open("fiber_yield_app_model.pkl", "rb") as f:
+_model_path = Path(__file__).parent / "fiber_yield_app_model.pkl"
+with open(_model_path, "rb") as f:
     BUNDLE = pickle.load(f)
 
 ensemble   = BUNDLE["ensemble"]
@@ -71,7 +81,6 @@ def build_input_row(location, genotype, water_pct, n_rate, soil_type):
 
 def transform(raw):
     raw = raw.copy()
-    # numeric columns ko wapas number banao (object -> float)
     for c in num_cols:
         raw[c] = pd.to_numeric(raw[c], errors="coerce")
 
@@ -81,6 +90,12 @@ def transform(raw):
                    Xc.reset_index(drop=True)], axis=1)
     X = X[FEATURES].astype(float)
     return X
+
+
+# ---- SHAP in separate thread (slow operation) ----
+def run_shap(X):
+    return explainer.shap_values(X, check_additivity=False)
+
 
 # ---- Routes ----
 @app.get("/health")
@@ -101,16 +116,28 @@ def options():
 
 
 @app.post("/predict")
-def predict(req: PredictRequest):
+async def predict(req: PredictRequest):
     raw = build_input_row(req.location, req.genotype,
-                           req.water_supply_pct, req.n_rate_kg_ha,
-                           req.soil_type)
+                          req.water_supply_pct, req.n_rate_kg_ha,
+                          req.soil_type)
     X = transform(raw)
 
     yhat = float(ensemble.predict(X)[0])
 
-    sv = explainer.shap_values(X)[0]
-    base_val = float(explainer.expected_value)
+    # ---- SHAP: run in thread with 25s timeout; fall back to feature importances ----
+    loop = asyncio.get_event_loop()
+    try:
+        shap_values = await asyncio.wait_for(
+            loop.run_in_executor(executor, lambda: run_shap(X)),
+            timeout=25.0,
+        )
+        sv = shap_values[0]
+        base_val = float(explainer.expected_value)
+    except asyncio.TimeoutError:
+        # SHAP too slow — approximate contributions from feature importances
+        fi = ensemble.feature_importances_
+        base_val = float(np.mean(ref_df[TARGET]) if TARGET in ref_df.columns else yhat)
+        sv = fi * (yhat - base_val)
     contribs = sorted(zip(FEATURES, sv, X.iloc[0].values),
                       key=lambda z: -abs(z[1]))[:5]
 
